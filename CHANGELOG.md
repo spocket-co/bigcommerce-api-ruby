@@ -1,7 +1,10 @@
 ## Next Release
 Your contribution here.
 
-* [#000](https://github.com/bigcommerce/bigcommerce-api-ruby/pull/000): Brief description here. - [@username](https://github.com/username).
+## 1.0.7
+
+* [#11](https://github.com/spocket-co/bigcommerce-api-ruby/pull/11): Security: bump `jwt` dependency to `>= 2.10.3, < 3.0` to address CVE-2026-45363 / GHSA-c32j-vqhx-rx3x (empty-key HMAC signature bypass, high severity). Fixes #10. - [@rajesh-spocket](https://github.com/rajesh-spocket).
+* [#11](https://github.com/spocket-co/bigcommerce-api-ruby/pull/11): Fix `Config#api_url` crashing with `undefined method 'presence' for nil` when `api_version` is blank (removed ActiveSupport-only `presence` call) and add unit specs. - [@rajesh-spocket](https://github.com/rajesh-spocket).
 
 ## 1.0.1
 

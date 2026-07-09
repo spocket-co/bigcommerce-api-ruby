@@ -7,7 +7,7 @@ module Bigcommerce
     def api_url
       return url if auth == 'legacy'
 
-      version = api_version.presence || 'v3/catalog'
+      version = api_version.to_s.strip.empty? ? 'v3/catalog' : api_version.to_s
       base = ENV['BC_API_ENDPOINT'].to_s.empty? ? DEFAULTS[:base_url] : ENV['BC_API_ENDPOINT']
       "#{base}/stores/#{store_hash}/#{version}"
     end
