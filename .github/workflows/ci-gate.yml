@@ -1,0 +1,176 @@
+name: ci-gate
+
+# Standalone copy of the shared pull-request gate (this repository is public, so it cannot call the
+# private shared workflow). The required status check is the final job, "ci-gate / gate".
+
+on:
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+env:
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+  OSV_SCANNER_VERSION: "2.6.0"
+  OSV_SCANNER_SHA256: "ca69b3d3cd08f889a49dc0a383122f71cc528b83803671df5fd874d97485b108"
+  # CVSS score at or above which a newly introduced vulnerability fails the check.
+  MIN_CVSS: "7.0"
+
+jobs:
+  secrets:
+    name: ci-gate / secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Plain git rather than actions/checkout: checkout's auth cleanup runs `git submodule foreach`,
+      # which fails outright in repositories that carry a submodule entry without a .gitmodules URL.
+      - name: Fetch the pull request's commits
+        env:
+          TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+        run: |
+          git init -q src
+          cd src
+          git config --local http.https://github.com/.extraheader \
+            "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
+          git remote add origin "https://github.com/${REPO}"
+          git fetch -q --no-tags --filter=blob:none origin "$BASE_SHA" "$HEAD_SHA"
+          git -c advice.detachedHead=false checkout -q "$HEAD_SHA"
+
+      - name: Install gitleaks
+        run: |
+          curl -sSfL -o gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+
+      - name: Scan the commits in this pull request
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+        # Only the PR's own commits are scanned, so history that predates the gate never blocks.
+        # Test code, fixtures and example env files are skipped by default: they hold fake keys by design.
+        # A repository can override this with its own .gitleaks.toml.
+        # False positives elsewhere: add the Fingerprint printed below to .gitleaksignore in the repository.
+        run: |
+          cd src
+          config=()
+          if [ ! -f .gitleaks.toml ]; then
+            cat > "$RUNNER_TEMP/gitleaks.toml" <<'EOF'
+          [extend]
+          useDefault = true
+
+          [[allowlists]]
+          description = "Test code, fixtures and example env files"
+          paths = [
+            '''(^|/)(tests?|specs?|__tests__|__mocks__|mocks?|fixtures?|testdata|test_data|cassettes|vcr_cassettes)/''',
+            '''(^|/)test_[^/]*\.py$''',
+            '''_(test|spec)\.(py|rb|go|js|ts)$''',
+            '''\.(test|spec)\.[cm]?[jt]sx?$''',
+            '''(^|/)(settings_test|conftest)\.py$''',
+            '''(^|/)\.env\.(example|sample|template|test)$''',
+            '''\.example$''',
+            '''(^|/)\.github/workflows/[^/]*test[^/]*\.ya?ml$''',
+          ]
+          EOF
+            config=(--config "$RUNNER_TEMP/gitleaks.toml")
+          fi
+          gitleaks git --no-banner --redact --verbose "${config[@]}" --log-opts="${BASE_SHA}..${HEAD_SHA}" .
+
+  deps:
+    name: ci-gate / deps
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Fetch pull request and base trees
+        env:
+          TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          # refs/pull/<n>/merge for pull requests, the queue branch for merge groups.
+          HEAD_REF: ${{ github.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: |
+          git init -q repo
+          git -C repo config --local http.https://github.com/.extraheader \
+            "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
+          git -C repo remote add origin "https://github.com/${REPO}"
+          git -C repo fetch -q --no-tags --depth=1 origin "$HEAD_REF"
+          head_sha=$(git -C repo rev-parse FETCH_HEAD)
+          git -C repo fetch -q --no-tags --depth=1 origin "$BASE_SHA"
+          mkdir head base
+          git -C repo archive "$head_sha" | tar -x -C head
+          git -C repo archive "$BASE_SHA" | tar -x -C base
+
+      - name: Install osv-scanner
+        run: |
+          curl -sSfL -o osv-scanner \
+            "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64"
+          echo "${OSV_SCANNER_SHA256}  osv-scanner" | sha256sum -c -
+          sudo install -m 0755 osv-scanner /usr/local/bin/osv-scanner
+
+      - name: Fail on high-severity vulnerabilities this pull request introduces
+        # Vulnerabilities already present on the base branch are reported by Dependabot and do not block.
+        run: |
+          set -euo pipefail
+
+          scan() {
+            local status=0
+            osv-scanner scan source -r --no-resolve --allow-no-lockfiles --format json "$1" > "$2" || status=$?
+            # 0 = clean, 1 = vulnerabilities found; anything else is a scanner failure.
+            if [ "$status" -gt 1 ]; then
+              echo "osv-scanner failed on $1 (exit $status)"
+              exit "$status"
+            fi
+          }
+
+          # One line per (ecosystem, package, advisory) at or above MIN_CVSS. Versions are left out on
+          # purpose, so bumping a package that keeps an existing advisory is not reported as new.
+          keys() {
+            jq -r --argjson min "$MIN_CVSS" '
+              [ .results[]?.packages[]?
+                | .package as $p
+                | .groups[]?
+                | select((.max_severity // "") != "" and ((.max_severity | tonumber) >= $min))
+                | "\($p.ecosystem)\t\($p.name)\t\(.ids | sort | first)\t\(.max_severity)" ]
+              | unique[]' "$1"
+          }
+
+          scan head head.json
+          scan base base.json
+          keys head.json | sort -u > head.keys
+          keys base.json | cut -f1-3 | sort -u > base.keys
+
+          awk -F'\t' 'NR == FNR { seen[$1 FS $2 FS $3] = 1; next } !(($1 FS $2 FS $3) in seen)' base.keys head.keys > new.keys
+
+          if [ -s new.keys ]; then
+            {
+              echo "### New high-severity dependency vulnerabilities"
+              echo
+              echo "| Ecosystem | Package | Advisory | CVSS |"
+              echo "|---|---|---|---|"
+              awk -F'\t' '{ printf "| %s | %s | %s | %s |\n", $1, $2, $3, $4 }' new.keys
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "No new dependency vulnerabilities at CVSS ${MIN_CVSS} or above." | tee -a "$GITHUB_STEP_SUMMARY"
+
+  gate:
+    name: ci-gate / gate
+    if: always()
+    needs: [secrets, deps]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every check to pass
+        env:
+          SECRETS_RESULT: ${{ needs.secrets.result }}
+          DEPS_RESULT: ${{ needs.deps.result }}
+        run: |
+          echo "secrets: ${SECRETS_RESULT}"
+          echo "deps: ${DEPS_RESULT}"
+          [ "${SECRETS_RESULT}" = "success" ] && [ "${DEPS_RESULT}" = "success" ]
